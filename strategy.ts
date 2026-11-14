@@ -17,20 +17,47 @@
 // same decisions.
 
 export const DEFAULTS = {
-  volBars: 360, // bars of 1-minute returns for the volatility
-  cooldown: 30, // bars after an exit before a new entry
+  volBars: 120, // bars of 1-minute returns for the volatility
+  cooldown: 60, // bars after an exit before a new entry
+  split: 3, // tranches per entry and per exit, one per bar: price impact is paid per bar's pool
 
   // washout sleeve
-  dipLookback: 360, // bars for the recent high
-  dipMinHist: 360, // bars of history before the first washout entry
-  dipK: 1.9, // dip = dipK * unit below the recent high
-  dipFloorBps: 150, // never call less than this a dip
+  dipLookback: 240, // bars for the recent high
+  dipMinHist: 60, // bars of history before the first washout entry
+  dipK: 2.317, // dip = dipK * unit below the recent high
+  dipFloorBps: 200, // never call less than this a dip
   bounceBars: 5, // the low the bounce is measured from
-  bounceFrac: 0.133, // bounce = this share of the dip, above that low
-  tpFrac: 0.667, // take-profit = this share of the dip
-  slFrac: 0.6, // stop-loss = this share of the dip
-  maxHold: 480, // bars
-  rideTrailFrac: 0.3, // > 0: past the take-profit, trail this share of the dip instead of selling
+  bounceFrac: 0.046, // bounce = this share of the dip, above that low
+  tpFrac: 0.269, // take-profit = this share of the dip
+  slFrac: 0.621, // stop-loss = this share of the dip
+  maxHold: 1440, // bars
+  rideTrailFrac: 0.063, // > 0: past the take-profit, trail this share of the dip instead of selling
+
+  // pullback sleeve (off while pbBars is 0): a smaller dip off the pbBars-bar high, bought on a
+  // bounce; with pbRegimeBars > 0 only during a recovery (that many bars after a washout entry,
+  // while price holds above the washout's low), else at any time
+  pbBars: 180,
+  pbK: 0.675,
+  pbFloorBps: 60,
+  pbBounceBars: 5,
+  pbBounceFrac: 0.048,
+  pbTpFrac: 0.532,
+  pbSlFrac: 0.69,
+  pbTrailFrac: 0,
+  pbMaxHold: 120,
+  pbRegimeBars: 720,
+  // rebuy sleeve: a second pullback sleeve with its own settings (same rules, prefix pb2), tried
+  // before the first, typically the higher-low rebuy while a washout recovers (pb2RegimeBars > 0)
+  pb2Bars: 180,
+  pb2K: 1.167,
+  pb2FloorBps: 80,
+  pb2BounceBars: 12,
+  pb2BounceFrac: 0,
+  pb2TpFrac: 1.673,
+  pb2SlFrac: 2.202,
+  pb2TrailFrac: 0,
+  pb2MaxHold: 720,
+  pb2RegimeBars: 360,
 
   // trend sleeve (off while brkBars is 0): a tight first stop cuts a false breakout fast, a wide
   // trailing stop lets a real run go on for hours
@@ -57,14 +84,17 @@ export class Strategy {
   n = 0;
   inPos = false;
   exiting = false;
-  kind: 'washout' | 'trend' | null = null; // the sleeve of the open (or pending) position
+  kind: 'washout' | 'pullback' | 'rebuy' | 'trend' | null = null; // the sleeve of the open (or pending) position
   entry = 0;
   peak = 0;
   held = 0;
   tp = 0;
   sl = 0;
   trail = 0;
+  holdCap = 0;
   sinceExit = 1e9;
+  lastWashout = -1e9; // bar count at the latest washout entry signal
+  washoutLow = Infinity; // the low that washout bounced off
 
   constructor(params: Partial<Params> = {}) {
     this.p = { ...DEFAULTS, ...params };
@@ -116,9 +146,16 @@ export class Strategy {
         this.tp = p.tpFrac * dip;
         this.sl = p.slFrac * dip;
         this.trail = p.rideTrailFrac * dip;
+        this.holdCap = p.maxHold;
+        this.lastWashout = this.n;
+        this.washoutLow = lo;
         return 'buy';
       }
     }
+
+    // rebuy, then pullback
+    if (this.pullback(close, 'rebuy', p.pb2Bars, p.pb2K, p.pb2FloorBps, p.pb2BounceBars, p.pb2BounceFrac, p.pb2TpFrac, p.pb2SlFrac, p.pb2TrailFrac, p.pb2MaxHold, p.pb2RegimeBars)) return 'buy';
+    if (this.pullback(close, 'pullback', p.pbBars, p.pbK, p.pbFloorBps, p.pbBounceBars, p.pbBounceFrac, p.pbTpFrac, p.pbSlFrac, p.pbTrailFrac, p.pbMaxHold, p.pbRegimeBars)) return 'buy';
 
     // trend
     if (p.brkBars > 0 && c.length > p.brkBars && c.length - 1 >= p.brkMinHist) {
@@ -133,6 +170,34 @@ export class Strategy {
       }
     }
     return null;
+  }
+
+  /**
+   * A pullback sleeve's entry: the close dipped at least max(k * unit(bars), floor) bps under the
+   * high of the last `bars` closes and bounced bounceFrac of that dip off the low of the last
+   * bounceBars closes. With regime > 0 it only runs within `regime` bars of a washout entry while
+   * price holds above the washout's low. On a signal it sets the position's exits.
+   */
+  pullback(close: number, kind: 'pullback' | 'rebuy', bars: number, k: number, floor: number, bounceBars: number, bounceFrac: number,
+    tpF: number, slF: number, trailF: number, hold: number, regime: number): boolean {
+    const c = this.closes;
+    if (bars <= 0 || c.length - 1 < bars) return false;
+    if (regime > 0 && !(this.n - this.lastWashout <= regime && close > this.washoutLow)) return false;
+    let hi = -Infinity;
+    for (let i = c.length - 1 - bars; i < c.length - 1; i++) if (c[i] > hi) hi = c[i];
+    let lo = Infinity;
+    for (let i = c.length - 1 - bounceBars; i < c.length - 1; i++) if (c[i] < lo) lo = c[i];
+    let dip = k * this.unit(bars);
+    if (dip < floor) dip = floor;
+    if ((1 - lo / hi) * 1e4 >= dip && (close / lo - 1) * 1e4 >= bounceFrac * dip) {
+      this.kind = kind;
+      this.tp = tpF * dip;
+      this.sl = slF * dip;
+      this.trail = trailF * dip;
+      this.holdCap = hold;
+      return true;
+    }
+    return false;
   }
 
   manage(close: number): Signal {
@@ -151,7 +216,7 @@ export class Strategy {
       const peakGain = (this.peak / this.entry - 1) * 1e4;
       if (this.trail > 0 && peakGain >= this.tp) out = fromPeak >= this.trail;
       else out = (this.trail <= 0 && gain >= this.tp) || gain <= -this.sl;
-      if (this.held >= p.maxHold) out = true;
+      if (this.held >= this.holdCap) out = true;
     }
     if (out) this.exiting = true;
     return out ? 'sell' : null;

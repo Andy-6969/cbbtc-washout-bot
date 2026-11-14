@@ -2,12 +2,15 @@
 //
 // Long only, one position, Node 22 standard library plus the kit's SDK shim (vendor/).
 //
-// Two sleeves, one position, always (nearly) all in (the logic is in strategy.ts):
-//  * washout: after a fall well below the 6-hour high, buy the first clear bounce; take profit,
-//    stop out or time out, and past the target trail the rebound instead of selling it.
-//  * trend: on a new 3-hour high with the fast average over the slow one, buy and ride it with a
-//    tight first stop and a wide trailing stop, so false breakouts cost little and real runs pay.
-// Every threshold scales with the RMS of 1-minute returns, so a calm day and a wild day read alike.
+// Four sleeves, one position, always (nearly) all in (the logic is in strategy.ts): washout (buy
+// the first bounce after a fall well below the recent high), rebuy (the higher-low pullback while
+// that washout recovers), pullback (smaller dips off the 3-hour high) and trend (new 3-hour highs,
+// ridden with a tight first stop and a wide trailing stop). Every threshold scales with the RMS of
+// 1-minute returns, so a calm day and a wild day read alike.
+//
+// Execution: each entry and each exit goes out in `split` equal tranches, one per bar. The replay
+// prices a fill's impact against that bar's own pool, so three tranches over three bars pay about
+// a third of the impact one order would (the delay is two minutes).
 //
 // The race ranks a bot that never trades below every bot that does, so if nothing has filled by
 // the last hour it buys a token 5 USDC and lets the replay sell it at the end (about a cent in
@@ -28,6 +31,9 @@ const FALLBACK_BAR = WINDOW_BARS - 60;
 const FALLBACK_QUOTE = 5_000_000n; // 5 USDC
 
 const strat = new Strategy();
+const K = strat.p.split; // tranches per entry and per exit, one per bar
+let mode: 'buy' | 'sell' | null = null; // the tranche run in progress
+let left = 0; // tranches still to send in it
 let px = 1;
 let first = 0;
 let traded = false;
@@ -41,7 +47,8 @@ await runBars({
     first = state.hello.first_close_ms;
   },
   onBatch(state: BarsState, batch: Batch): OrderInput[] {
-    // sync the strategy with what actually filled
+    // sync the strategy with what actually filled: the first tranche of an entry sets its
+    // entry price, and the position counts as closed once nothing of it is left
     for (const f of batch.fills) {
       const fb = f.client_id.startsWith('fb');
       if (f.status !== 'filled') {
@@ -50,22 +57,45 @@ await runBars({
       }
       traded = true;
       if (fb) continue;
-      if (f.side === 'buy') strat.filledBuy(Number(f.price) / px);
-      else if (!state.positions.has(SYMBOL)) strat.filledSell();
+      if (f.side === 'buy') {
+        if (!strat.inPos) strat.filledBuy(Number(f.price) / px);
+      } else if (!state.positions.has(SYMBOL)) {
+        strat.filledSell();
+        mode = null;
+      }
     }
     const bar = batch.bars.find((b) => b.symbol === SYMBOL);
     if (bar === undefined) return [];
-    if (strat.inPos && !state.positions.has(SYMBOL)) strat.filledSell();
+    if (strat.inPos && !state.positions.has(SYMBOL)) {
+      strat.filledSell();
+      mode = null;
+    }
 
     const signal = strat.step(Number(bar.c) / px);
     const held = state.positions.get(SYMBOL);
-    if (signal === 'sell' && held !== undefined) {
-      return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: EXIT_SLIPPAGE_BPS }];
+    if (signal === 'sell' && held !== undefined && mode !== 'sell') {
+      mode = 'sell';
+      left = K;
+    }
+    if (signal === 'buy' && !strat.inPos && held === undefined) {
+      mode = 'buy';
+      left = K;
     }
     const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
-    if (signal === 'buy' && !strat.inPos) {
-      const spend = state.cash - state.cash / 1000n; // keep a hair of cash back
+    if (mode === 'buy') {
+      // an equal share of the cash per remaining tranche; the last keeps a hair of cash back
+      const spend = left > 1 ? state.cash / BigInt(left) : state.cash - state.cash / 1000n;
+      left--;
+      if (left <= 0) mode = null;
       if (spend >= minNotional) return [{ side: 'buy', symbol: SYMBOL, notional_quote_units: spend, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      return [];
+    }
+    if (mode === 'sell' && held !== undefined) {
+      // an equal share of what is left per remaining tranche; the last (repeated until it
+      // fills) sells everything
+      const qty = left > 1 ? held.qty / BigInt(left) : held.qty;
+      if (left > 1) left--;
+      return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: EXIT_SLIPPAGE_BPS }];
     }
     const idx = Math.floor((batch.t - first) / 60000);
     if (!traded && !fallbackSent && held === undefined && idx >= FALLBACK_BAR && idx < WINDOW_BARS - 2 && state.cash >= FALLBACK_QUOTE) {
