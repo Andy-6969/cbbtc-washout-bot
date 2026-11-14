@@ -21,7 +21,8 @@
 import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
-const MAX_SLIPPAGE_BPS = 60;
+const MAX_SLIPPAGE_BPS = 60; // entries: skip a buy that would fill far above the signal close
+const EXIT_SLIPPAGE_BPS = 300; // exits: wider, so a stop in a fast fall still gets out
 
 const P = {
   dipLookback: 360, // bars for the recent high
@@ -46,6 +47,7 @@ class Strategy {
   closes: number[] = [];
   sq: number[] = []; // squared 1-minute returns
   inPos = false;
+  exiting = false;
   entry = 0;
   held = 0;
   tp = 0;
@@ -75,8 +77,14 @@ class Strategy {
 
     if (this.inPos) {
       this.held++;
+      // once an exit is decided it stands until a sell fills: a sell the market refused
+      // (slippage cap, no bar) is sent again on the next bar even if the price came back
+      if (this.exiting) return 'sell';
       const gain = (close / this.entry - 1) * 1e4;
-      if (gain >= this.tp || gain <= -this.sl || this.held >= P.maxHold) return 'sell';
+      if (gain >= this.tp || gain <= -this.sl || this.held >= P.maxHold) {
+        this.exiting = true;
+        return 'sell';
+      }
       return null;
     }
 
@@ -99,12 +107,14 @@ class Strategy {
 
   filledBuy(price: number): void {
     this.inPos = true;
+    this.exiting = false;
     this.entry = price;
     this.held = 0;
   }
 
   filledSell(): void {
     this.inPos = false;
+    this.exiting = false;
     this.sinceExit = 0;
   }
 }
@@ -142,7 +152,7 @@ await runBars({
     const signal = strat.step(Number(bar.c) / px);
     const held = state.positions.get(SYMBOL);
     if (signal === 'sell' && held !== undefined) {
-      return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
+      return [{ side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: EXIT_SLIPPAGE_BPS }];
     }
     const minNotional = BigInt(state.hello.fees.min_notional_quote_units);
     if (signal === 'buy' && !strat.inPos) {
