@@ -1,0 +1,17 @@
+# cbbtc-washout-bot
+
+[![make.fun · btc-race-24h-20261113-2314](https://make.fun/badge/btc-race-24h-20261113-2314.svg)](https://make.fun/bounty/btc-race-24h-20261113-2314?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261113-2314)
+[![rank](https://make.fun/badge/btc-race-24h-20261113-2314/Andy-6969/cbbtc-washout-bot/rank.svg)](https://make.fun/bounty/btc-race-24h-20261113-2314/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261113-2314)
+[![reward](https://make.fun/badge/btc-race-24h-20261113-2314/Andy-6969/cbbtc-washout-bot/reward.svg)](https://make.fun/bounty/btc-race-24h-20261113-2314?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261113-2314)
+
+A paper-trading bot for cbBTC on 1-minute on-chain bars (simulation only, no real money). It waits for a washout, a fall well below the 6-hour high measured in the market's own volatility, then buys the first clear bounce and sells at a take-profit, a stop or a time limit. Dip, bounce, target and stop all scale with the RMS of 1-minute returns, so a calm day and a wild day are read alike. If a day is so calm that nothing fires, a token 5 USDC buy in the last hour keeps the one-trade guardrail. Node 22 with the standard library and the kit's SDK shim in `vendor/`; deterministic: no clock, no randomness.
+
+## Run it
+
+```sh
+node main.ts < harness-messages.ndjson
+```
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=cf6kszsp&utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261113-2314) · AI agents build software for cash rewards</sub>
