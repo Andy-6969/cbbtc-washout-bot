@@ -2,14 +2,12 @@
 //
 // Long only, one position, Node 22 standard library plus the kit's SDK shim (vendor/).
 //
-// The idea: buy the snap-back after a washout. When cbBTC has fallen a long way below its recent
-// high (a "dip") and then closes clearly above the lowest close of the last few bars (a "bounce"),
-// buy with almost all the cash; sell at a take-profit, a stop-loss or a time limit.
-//
-// "A long way" is measured against the market's own volatility, so the bot reads a calm day and a
-// wild day alike: unit = RMS of 1-minute returns x sqrt(lookback), the typical move over the
-// lookback, and dip, bounce, take-profit and stop are multiples of it (dip never under a floor, so
-// a trade always aims well past the ~26 bps a round trip costs).
+// Two sleeves, one position, always (nearly) all in (the logic is in strategy.ts):
+//  * washout: after a fall well below the 6-hour high, buy the first clear bounce; take profit,
+//    stop out or time out, and past the target trail the rebound instead of selling it.
+//  * trend: on a new 3-hour high with the fast average over the slow one, buy and ride it with a
+//    tight first stop and a wide trailing stop, so false breakouts cost little and real runs pay.
+// Every threshold scales with the RMS of 1-minute returns, so a calm day and a wild day read alike.
 //
 // The race ranks a bot that never trades below every bot that does, so if nothing has filled by
 // the last hour it buys a token 5 USDC and lets the replay sell it at the end (about a cent in
@@ -19,105 +17,15 @@
 // clock, no randomness: two runs on the same bars send the same orders byte for byte.
 
 import { runBars, type BarsState, type Batch, type OrderInput } from './vendor/makefun-bars.ts';
+import { Strategy } from './strategy.ts';
 
 const SYMBOL = 'CBBTC';
 const MAX_SLIPPAGE_BPS = 60; // entries: skip a buy that would fill far above the signal close
 const EXIT_SLIPPAGE_BPS = 300; // exits: wider, so a stop in a fast fall still gets out
 
-const P = {
-  dipLookback: 360, // bars for the recent high
-  dipMinHist: 360, // bars of history before the first entry
-  volBars: 360, // bars of 1-minute returns for the volatility
-  dipK: 1.9, // dip = dipK * unit below the recent high
-  dipFloorBps: 150, // never call less than this a dip
-  bounceBars: 5, // the low the bounce is measured from
-  bounceFrac: 0.133, // bounce = this share of the dip, above that low
-  tpFrac: 0.667, // take-profit = this share of the dip
-  slFrac: 0.6, // stop-loss = this share of the dip
-  maxHold: 480, // bars
-  cooldown: 30, // bars after an exit before a new entry
-};
-
 const WINDOW_BARS = 1440;
 const FALLBACK_BAR = WINDOW_BARS - 60;
 const FALLBACK_QUOTE = 5_000_000n; // 5 USDC
-
-/** Pure decision logic: feed closes in, get 'buy', 'sell' or null out. */
-class Strategy {
-  closes: number[] = [];
-  sq: number[] = []; // squared 1-minute returns
-  inPos = false;
-  exiting = false;
-  entry = 0;
-  held = 0;
-  tp = 0;
-  sl = 0;
-  sinceExit = 1e9;
-
-  /** [dip, bounce, tp, sl] in bps for a lookback of lb bars. */
-  thresholds(lb: number): [number, number, number, number] {
-    const w = this.sq.slice(-P.volBars);
-    let s = 0;
-    for (const x of w) s += x;
-    const sigma = w.length > 0 ? Math.sqrt(s / w.length) * 1e4 : 0;
-    let dip = P.dipK * sigma * Math.sqrt(lb);
-    if (dip < P.dipFloorBps) dip = P.dipFloorBps;
-    return [dip, P.bounceFrac * dip, P.tpFrac * dip, P.slFrac * dip];
-  }
-
-  step(close: number): 'buy' | 'sell' | null {
-    const c = this.closes;
-    if (c.length > 0) {
-      const r = close / c[c.length - 1] - 1;
-      this.sq.push(r * r);
-      if (this.sq.length > 2000) this.sq.splice(0, 1000);
-    }
-    c.push(close);
-    if (c.length > 2000) c.splice(0, 1000);
-
-    if (this.inPos) {
-      this.held++;
-      // once an exit is decided it stands until a sell fills: a sell the market refused
-      // (slippage cap, no bar) is sent again on the next bar even if the price came back
-      if (this.exiting) return 'sell';
-      const gain = (close / this.entry - 1) * 1e4;
-      if (gain >= this.tp || gain <= -this.sl || this.held >= P.maxHold) {
-        this.exiting = true;
-        return 'sell';
-      }
-      return null;
-    }
-
-    this.sinceExit++;
-    if (this.sinceExit < P.cooldown) return null;
-    const lb = Math.min(P.dipLookback, c.length - 1);
-    if (lb < P.dipMinHist) return null;
-    let hi = -Infinity;
-    for (let i = c.length - 1 - lb; i < c.length - 1; i++) if (c[i] > hi) hi = c[i];
-    let lo = Infinity;
-    for (let i = c.length - 1 - P.bounceBars; i < c.length - 1; i++) if (c[i] < lo) lo = c[i];
-    const [dip, bounce, tp, sl] = this.thresholds(lb);
-    if ((1 - lo / hi) * 1e4 >= dip && (close / lo - 1) * 1e4 >= bounce) {
-      this.tp = tp;
-      this.sl = sl;
-      return 'buy';
-    }
-    return null;
-  }
-
-  filledBuy(price: number): void {
-    this.inPos = true;
-    this.exiting = false;
-    this.entry = price;
-    this.held = 0;
-  }
-
-  filledSell(): void {
-    this.inPos = false;
-    this.exiting = false;
-    this.sinceExit = 0;
-  }
-}
 
 const strat = new Strategy();
 let px = 1;
